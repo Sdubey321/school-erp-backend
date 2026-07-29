@@ -8,6 +8,7 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import * as bcrypt from 'bcryptjs';
 import { Role } from '@prisma/client';
 
@@ -17,6 +18,7 @@ export class AuthService {
     private prisma: PrismaService,
     private jwtService: JwtService,
     private config: ConfigService,
+    private notificationsService: NotificationsService,
   ) {}
 
   async validateUser(email: string, password: string) {
@@ -90,9 +92,137 @@ export class AuthService {
     const hashed = await bcrypt.hash(newPassword, 10);
     await this.prisma.user.update({
       where: { id: userId },
-      data: { password: hashed },
+      data: { password: hashed, mustChangePassword: false },
     });
     return { message: 'Password changed successfully' };
+  }
+
+  /**
+   * Force-change password: user does NOT need to supply current password.
+   * Only callable when mustChangePassword === true for that user.
+   */
+  async forceChangePassword(userId: string, newPassword: string, confirmPassword: string) {
+    if (newPassword !== confirmPassword) {
+      throw new BadRequestException('Passwords do not match');
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+
+    if (!user.mustChangePassword) {
+      throw new ForbiddenException('Password change is not required for this account');
+    }
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { password: hashed, mustChangePassword: false },
+    });
+    return { message: 'Password updated successfully' };
+  }
+
+  /**
+   * Admin resets any user's password in the same school.
+   * Sets mustChangePassword = true and sends a notification.
+   */
+  async adminResetPassword(
+    adminUserId: string,
+    targetUserId: string,
+    newPassword: string,
+    adminRole: string,
+  ) {
+    const admin = await this.prisma.user.findUnique({ where: { id: adminUserId } });
+    if (!admin) throw new NotFoundException('Admin not found');
+
+    const target = await this.prisma.user.findUnique({ where: { id: targetUserId } });
+    if (!target) throw new NotFoundException('Target user not found');
+
+    // SCHOOL_ADMIN can only reset users in same school
+    if (adminRole === 'SCHOOL_ADMIN' && target.schoolId !== admin.schoolId) {
+      throw new ForbiddenException('You can only reset passwords for users in your school');
+    }
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await this.prisma.user.update({
+      where: { id: targetUserId },
+      data: { password: hashed, mustChangePassword: true },
+    });
+
+    // Send in-app notification to the target user
+    const adminName = `${admin.firstName} ${admin.lastName}`;
+    const schoolId = target.schoolId || admin.schoolId;
+    if (schoolId) {
+      await this.notificationsService.createPasswordResetNotification(
+        targetUserId,
+        schoolId,
+        adminName,
+        adminRole,
+      );
+    }
+
+    return { message: `Password reset successfully for ${target.firstName} ${target.lastName}` };
+  }
+
+  /**
+   * Class teacher resets a student password — only if the student
+   * belongs to the teacher's assigned class.
+   */
+  async teacherResetStudentPassword(
+    teacherUserId: string,
+    targetStudentUserId: string,
+    newPassword: string,
+  ) {
+    const teacherUser = await this.prisma.user.findUnique({
+      where: { id: teacherUserId },
+      include: {
+        teacher: {
+          include: {
+            classTeacherOf: {
+              include: { students: { include: { user: true } } },
+            },
+          },
+        },
+      },
+    });
+
+    if (!teacherUser?.teacher) throw new ForbiddenException('Teacher profile not found');
+
+    const classTeacherOf = teacherUser.teacher.classTeacherOf;
+    if (!classTeacherOf || classTeacherOf.length === 0) {
+      throw new ForbiddenException('You are not assigned as a class teacher');
+    }
+
+    // Gather all student user IDs from teacher's classes
+    const allowedUserIds = classTeacherOf.flatMap((cls) =>
+      cls.students.map((s) => s.user.id),
+    );
+
+    if (!allowedUserIds.includes(targetStudentUserId)) {
+      throw new ForbiddenException('This student is not in your class');
+    }
+
+    const targetUser = await this.prisma.user.findUnique({ where: { id: targetStudentUserId } });
+    if (!targetUser) throw new NotFoundException('Student user not found');
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await this.prisma.user.update({
+      where: { id: targetStudentUserId },
+      data: { password: hashed, mustChangePassword: true },
+    });
+
+    // Send notification
+    const teacherName = `${teacherUser.firstName} ${teacherUser.lastName}`;
+    const schoolId = targetUser.schoolId;
+    if (schoolId) {
+      await this.notificationsService.createPasswordResetNotification(
+        targetStudentUserId,
+        schoolId,
+        teacherName,
+        'TEACHER',
+      );
+    }
+
+    return { message: `Password reset successfully for ${targetUser.firstName} ${targetUser.lastName}` };
   }
 
   async getProfile(userId: string) {
@@ -107,6 +237,7 @@ export class AuthService {
         phone: true,
         avatar: true,
         isActive: true,
+        mustChangePassword: true,
         createdAt: true,
         schoolId: true,
         school: { select: { id: true, name: true, logo: true, code: true } },
@@ -154,4 +285,3 @@ export class AuthService {
     return { accessToken, refreshToken };
   }
 }
-
